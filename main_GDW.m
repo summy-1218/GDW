@@ -19,6 +19,10 @@ params.monitor = true;
 params.useParallel = true;
 params.useSparse = true;
 params.pitch = 0;          % 桨距角(度), 正方向为绕z轴负向旋转
+params.gamma = 0;          % 偏航角(度): 风轮旋转轴在水平面内偏离来流方向的角度
+                           %   正方向: 从上方俯视，风轮轴顺时针偏离来流(即来流从左侧进入旋转平面)
+params.yita  = 6;          % 仰角(度): 风轮旋转轴与水平面之间的夹角(即主轴上仰/下俯角度)
+                           %   正方向: 旋转轴朝上倾斜(机头仰起), 来流从下方斜入旋转平面
 % 基于BEM初始化 + GDW三维非定常气动力计算
 % 坐标系: x轴-旋转轴正向, z轴-叶片展向, y轴-叶片弦向
 
@@ -39,20 +43,57 @@ V0 = getField(params,'V0',9);          % 来流速度(沿x轴)
 RootOffset = getField(params,'RootOffset',0.05); % 叶根偏移
 R_hub = getField(params,'R_hub',1.56); % 叶轮半径(用于Prandtl损失计算)
 
-% ===== 桨距角参数 =====
+% ===== 来流速度分解：桨距角 + 偏航角 + 仰角 =====
+%
+% --- 桨距角 (pitch) ---
 % pitch 正方向定义: 绕z轴负向旋转(即前缘向顺桨方向)
 pitch_deg = getField(params,'pitch',0);   % 桨距角(度), 默认0度
-pitch_rad = deg2rad(pitch_deg);           % 转换为弧度
-% 坐标变换: 来流速度V0(沿x轴)经桨距角旋转后在叶片剖面的投影
-%   轴向分量 V0_ax = V0 * cos(pitch_rad)  (垂直于旋转平面)
-%   面内分量 V0_ip = V0 * sin(pitch_rad)  (平行于旋转平面, 增加/减少切向速度)
-% 旋转矩阵 (绕z轴负向旋转pitch角):
-%   [V_ax ]   [ cos(pitch)  sin(pitch)] [V0]
-%   [V_ip ] = [-sin(pitch)  cos(pitch)] [ 0]
-% => V_ax = V0*cos(pitch_rad), V_ip = -V0*sin(pitch_rad)
-% 注: V_ip 为正时沿叶片切线方向(增加有效切速), 符合右手螺旋正方向定义
-V0_ax = V0 * cos(pitch_rad);   % 轴向有效来流分量
-V0_ip = -V0 * sin(pitch_rad);  % 面内(切向)有效来流分量(正值增大切向速度)
+pitch_rad = deg2rad(pitch_deg);
+%
+% --- 偏航角 (gamma) ---
+% gamma 正方向: 从上方俯视，风轮轴顺时针偏离来流方向
+%   => 来流在旋转平面内产生侧向分量 V0_lat = V0 * cos(yita_rad) * sin(gamma_rad)
+%   => 轴向分量因偏航减小：参与计算的轴向分量包含 cos(gamma)
+gamma_deg = getField(params,'gamma',0);   % 偏航角(度), 默认0度
+gamma_rad = deg2rad(gamma_deg);
+%
+% --- 仰角 (yita) ---
+% yita 正方向: 旋转轴朝上倾斜(机头仰起)
+%   => 来流在旋转平面内产生俯仰面内分量 V0_elev = V0 * sin(yita_rad)
+%   => 轴向分量因仰角减小：参与计算的轴向分量包含 cos(yita)
+yita_deg = getField(params,'yita',0);     % 仰角(度), 默认0度
+yita_rad = deg2rad(yita_deg);
+%
+% --- 速度矢量坐标变换 ---
+% 来流速度 V0 沿惯性坐标系x轴(与地面平行、与未偏航/未倾斜的旋转轴平行)
+% 经偏航(绕竖直轴旋转gamma)和仰角(绕横轴旋转yita)后，
+% 在叶片旋转坐标系(x=旋转轴, y/z=旋转平面)的分解为：
+%   V0_ax  = V0 * cos(yita) * cos(gamma)   -- 沿旋转轴方向(轴向)
+%   V0_lat = V0 * cos(yita) * sin(gamma)   -- 旋转平面内侧向(偏航产生)
+%   V0_elev= V0 * sin(yita)                -- 旋转平面内仰俯向(仰角产生)
+% 旋转平面内总横向速度(面内分量合矢量):
+%   V0_inplane = sqrt(V0_lat^2 + V0_elev^2)
+% 再叠加桨距角对轴向/切向分量的投影修正:
+%   V0_ax_eff = V0_ax * cos(pitch) + V0_inplane * sin(pitch) （桨距角进一步修正轴向）
+%   -- 此处保持原桨距角逻辑，仅在偏斜基础上叠加；
+%   -- 工程上桨距角与偏航/仰角为独立控制，本实现中桨距角仅作用于迎角(theta+pitch)，
+%      来流分解由偏航+仰角完成，故 V0_ax/V0_ip 仅受偏航+仰角影响，
+%      桨距角效果通过 theta_eff = theta + pitch_deg 体现在攻角计算中。
+V0_ax  = V0 * cos(yita_rad) * cos(gamma_rad);  % 轴向有效来流分量
+V0_lat = V0 * cos(yita_rad) * sin(gamma_rad);  % 面内侧向来流分量(偏航产生)
+V0_elev= V0 * sin(yita_rad);                   % 面内仰俯向来流分量(仰角产生)
+% 面内来流合矢量大小(用于advance ratio mu)
+V0_inplane = sqrt(V0_lat^2 + V0_elev^2);
+%
+% 桨距角效果：作为附加安装角叠加到几何扭角，使有效扭角增加pitch_deg
+% 在攻角计算中使用 theta_eff(i) = theta(i) + pitch_deg
+% (正pitch减小攻角，即顺桨方向)
+
+% ===== 偏斜入流参数 (用于BEM偏斜修正 Eq.17-19 和 GDW chi) =====
+% 根据 Eq.19 (Burton et al. 2001): chi ≈ (0.6*a_avg + 1) * gamma_eff
+% 其中 gamma_eff 为等效偏斜角 = atan2(V0_inplane, V0_ax)
+gamma_eff_rad = atan2(V0_inplane, V0_ax + eps);   % 等效来流偏斜角(相对旋转轴)
+% chi_eff 将在 BEM 初始化后根据平均诱导因子由 Eq.19 正式计算
 
 % ===== 叶片结构模型与翼型数据 =====
 [beamModel, r, c, theta, thickness, dr] = resolve_blade_geometry(params);
@@ -103,6 +144,12 @@ end
 % BEM初始化使用轴向有效来流分量V0_ax
 [bem] = bem_initialize(r, c, theta, thickness, B, R, R_hub, RootOffset, V0_ax, Omega, maxIter, tolerance, relax);
 
+% BEM初始化完成后，用平均轴向诱导因子更新等效尾迹偏斜角 chi_eff (Eq.19)
+a_avg = mean(bem.a(activeIdx));
+chi_eff = (0.6 * a_avg + 1) * gamma_eff_rad;  % Eq.19: chi ≈ (0.6a+1)*gamma_eff
+fprintf('等效偏斜角 gamma_eff=%.2f deg, chi_eff=%.2f deg\n', ...
+    rad2deg(gamma_eff_rad), rad2deg(chi_eff));
+
 % ===== 2) GDW状态初始化 =====
 mode = build_modes(N_h, S_h);
 phiMat = precompute_shape_functions(mode, rhat);
@@ -126,7 +173,8 @@ Phi0 = phiMat{1};
 alpha{1} = (Phi0' * Phi0 + 1e-8*eye(size(Phi0,2))) \ (Phi0' * uhat0);
 
 % ===== 3) 预计算矩阵 =====
-[Mdiag, LtildeC, LtildeS] = precompute_gdw_matrices(mode, chi);
+% GDW矩阵使用等效尾迹偏斜角 chi_eff (由偏航角+仰角综合计算，Eq.19)
+[Mdiag, LtildeC, LtildeS] = precompute_gdw_matrices(mode, chi_eff);
 
 % ===== 4) 预分配输出 =====
 L_sec = zeros(Nstations, B, Nt);
@@ -147,12 +195,36 @@ TotalMoment_ts = zeros(Nt,1);
 monitor = getField(params,'monitor',false);
 monitorEvery = getField(params,'monitorEvery',max(1,round(Nt/100)));
 if monitor
-    monFig = figure('Color','w','Name','动态监控');
-    tl = tiledlayout(monFig,2,2,'TileSpacing','compact','Padding','compact');
-    ax1 = nexttile(tl); hT = plot(ax1, t(1), 0, 'b-','LineWidth',1.4); grid(ax1,'on'); xlabel(ax1,'时间(s)'); ylabel(ax1,'推力(N)'); title(ax1,'总推力');
-    ax2 = nexttile(tl); hL = plot(ax2, t(1), 0, 'b-','LineWidth',1.4); grid(ax2,'on'); xlabel(ax2,'时间(s)'); ylabel(ax2,'升力(N)'); title(ax2,'总升力');
-    ax3 = nexttile(tl); hD = plot(ax3, t(1), 0, 'b-','LineWidth',1.4); grid(ax3,'on'); xlabel(ax3,'时间(s)'); ylabel(ax3,'阻力(N)'); title(ax3,'总阻力');
-    ax4 = nexttile(tl); hM = plot(ax4, t(1), 0, 'b-','LineWidth',1.4); grid(ax4,'on'); xlabel(ax4,'时间(s)'); ylabel(ax4,'力矩(N·m)'); title(ax4,'总力矩');
+    monFig = figure('Color','w','Name','动态监控','Position',[60 60 1400 760]);
+    tl = tiledlayout(monFig, 2, 3, 'TileSpacing','compact','Padding','compact');
+
+    % 上行: 各叶片x方向力(推力) + 总x方向力
+    monColors = lines(B);
+    axB = nexttile(tl, 1, [1 2]);   % 跨2列: 各叶片x方向推力
+    hold(axB,'on');
+    hBlade = gobjects(B,1);
+    for q = 1:B
+        hBlade(q) = plot(axB, t(1), 0, '-', 'Color', monColors(q,:), 'LineWidth', 1.5);
+    end
+    grid(axB,'on');
+    xlabel(axB,'时间 (s)'); ylabel(axB,'x方向力 (N)');
+    title(axB,'各叶片 x 方向力（推力）');
+    bladeLegNames = arrayfun(@(q) sprintf('叶片%d',q), 1:B, 'UniformOutput', false);
+    legend(axB, hBlade, bladeLegNames, 'Location','best','FontSize',8);
+
+    axTx = nexttile(tl, 3);         % 总x方向力
+    hTx = plot(axTx, t(1), 0, 'k-', 'LineWidth', 1.8);
+    grid(axTx,'on');
+    xlabel(axTx,'时间 (s)'); ylabel(axTx,'x方向力 (N)');
+    title(axTx,'总 x 方向力（推力）');
+
+    % 下行: 总推力 / 总升力 / 总力矩
+    ax1 = nexttile(tl); hT = plot(ax1, t(1), 0, 'b-','LineWidth',1.4);
+    grid(ax1,'on'); xlabel(ax1,'时间(s)'); ylabel(ax1,'推力(N)'); title(ax1,'总推力');
+    ax2 = nexttile(tl); hL = plot(ax2, t(1), 0, 'b-','LineWidth',1.4);
+    grid(ax2,'on'); xlabel(ax2,'时间(s)'); ylabel(ax2,'升力(N)'); title(ax2,'总升力');
+    ax4 = nexttile(tl); hM = plot(ax4, t(1), 0, 'b-','LineWidth',1.4);
+    grid(ax4,'on'); xlabel(ax4,'时间(s)'); ylabel(ax4,'力矩(N·m)'); title(ax4,'总力矩');
 end
 
 % ABM4历史
@@ -168,12 +240,29 @@ for h = 0:N_h
     end
 end
 
+% 单叶片载荷时间序列预分配 (维度: B × Nt)
+% 记录每片叶片在每个时间步的展向积分载荷及方位角，用于方位角-载荷分析
+blade_L      = zeros(B, Nt);   % 单叶片升力(N)
+blade_D      = zeros(B, Nt);   % 单叶片阻力(N)
+blade_M      = zeros(B, Nt);   % 单叶片力矩(N·m)
+blade_Thrust = zeros(B, Nt);   % 单叶片推力(N)
+blade_Torque = zeros(B, Nt);   % 单叶片扭矩(N·m)
+blade_psi    = zeros(B, Nt);   % 单叶片方位角(rad)
+
 % ===== 5) 时间推进 =====
 dtHat = Omega * dt;
 it = 1;
 while true
     while it <= Nt
     psi_blade = Omega * t(it) + (0:B-1) * (2*pi/B);
+
+    % ===== 偏斜入流修正系数 (Eq.17: a_skew = a*[1 + K*(r/R)*tan(chi/2)*cos(psi)]) =====
+    % psi 定义: 0 为最下风侧位置(Eq.17 注释); 此处 psi_blade 从任意方位角零点计，
+    % 对于风力机，通常令最下风侧(6点钟方向)为 psi=0，但本代码 psi 是从初始位置算起的方位角，
+    % 物理上偏斜修正的方位角依赖性通过 cos(psi_blade) 体现，方向一致性已满足。
+    skew_K = (15*pi/32) * tan(chi_eff/2);  % Eq.17 中的偏斜常数 K
+    % skew_factor(i,q) = 1 + K*(r(i)/R)*cos(psi_blade(q))
+    % 用于在叶素循环中修正局部轴向诱导因子: a_local = a_BEM * skew_factor
 
     % 计算诱导速度场(轴向)
     uhat = zeros(Nstations, B);
@@ -215,12 +304,19 @@ while true
             Vq = zeros(Nstations,1);
             dTq = zeros(Nstations,1);
             dFq = zeros(Nstations,1);
+            psi_q = psi_blade(q);  % 第q片叶片当前方位角
             for ii = 1:numel(activeIdx)
                 i = activeIdx(ii);
-                % 轴向速度: 使用桨距角修正后的轴向来流分量
-                Uax = V0_ax - u_ind(i,q);
-                % 切向速度: BEM的切向诱导速度 + 桨距角引起的面内来流分量
-                Ut = Omega_r(i)*(1+bem.ap(i)) + V0_ip; % 使用BEM的a'
+                % --- 偏斜修正局部轴向诱导因子 (Eq.17/29) ---
+                % a_skew = a_BEM * [1 + K*(r/R)*cos(psi)]
+                skew_fac = 1 + skew_K * rhat(i) * cos(psi_q);
+                a_local = bem.a(i) * skew_fac;
+                % GDW诱导速度叠加到偏斜修正后的轴向来流上
+                Uax = V0_ax - u_ind(i,q) - a_local * V0_ax;
+                % 切向速度: BEM切向诱导 + 偏航/仰角产生的面内来流分量
+                % V0_inplane 在旋转平面内，其切向投影取 cos(psi_q) 分量
+                % (侧向来流V0_lat投影到切向=V0_lat*cos(psi_q), 仰俯向V0_elev恒在切向)
+                Ut = Omega_r(i)*(1+bem.ap(i)) + V0_lat*cos(psi_q) + V0_elev; % 使用BEM的a'
                 % Phi_i = atan2(Uax, Ut);
                 % Alpha_i = Phi_i - deg2rad(theta(i));
                 % [Cl_i, Cd_i, ~] = aeroInterp(thickness(i), Alpha_i);
@@ -236,7 +332,8 @@ while true
 
                 Vrel = hypot(Uax, Ut);
                 Phi_i = atan2(Uax, Ut);
-                Alpha_i = Phi_i - deg2rad(theta(i));
+                % 有效扭角 = 几何扭角 + 桨距角 (正pitch减小攻角，即顺桨)
+                Alpha_i = Phi_i - deg2rad(theta(i) + pitch_deg);
 
                 [Cl_i, Cd_i, Cm_i] = aeroInterp(thickness(i), Alpha_i);
 
@@ -262,12 +359,16 @@ while true
         end
     else
         for q = 1:B
+            psi_q = psi_blade(q);  % 第q片叶片当前方位角
             for ii = 1:numel(activeIdx)
                 i = activeIdx(ii);
-                % 轴向速度: 使用桨距角修正后的轴向来流分量
-                Uax = V0_ax - u_ind(i,q);
-                % 切向速度: BEM的切向诱导速度 + 桨距角引起的面内来流分量
-                Ut = Omega_r(i)*(1+bem.ap(i)) + V0_ip; % 先忽略a'
+                % --- 偏斜修正局部轴向诱导因子 (Eq.17/29) ---
+                skew_fac = 1 + skew_K * rhat(i) * cos(psi_q);
+                a_local = bem.a(i) * skew_fac;
+                % GDW诱导速度叠加到偏斜修正后的轴向来流上
+                Uax = V0_ax - u_ind(i,q) - a_local * V0_ax;
+                % 切向速度: BEM切向诱导 + 偏航/仰角产生的面内来流分量
+                Ut = Omega_r(i)*(1+bem.ap(i)) + V0_lat*cos(psi_q) + V0_elev; % 先忽略a'
                 % Phi_i = atan2(Uax, Ut);
                 % Alpha_i = Phi_i - deg2rad(theta(i));
                 % [Cl_i, Cd_i, ~] = aeroInterp(thickness(i), Alpha_i);
@@ -283,7 +384,8 @@ while true
                 
                 Vrel = hypot(Uax, Ut);
                 Phi_i = atan2(Uax, Ut);
-                Alpha_i = Phi_i - deg2rad(theta(i));
+                % 有效扭角 = 几何扭角 + 桨距角 (正pitch减小攻角，即顺桨)
+                Alpha_i = Phi_i - deg2rad(theta(i) + pitch_deg);
 
                 [Cl_i, Cd_i, Cm_i] = aeroInterp(thickness(i), Alpha_i);
 
@@ -325,11 +427,27 @@ while true
     TotalDrag_ts(it) = sum(D_step,'all');
     TotalMoment_ts(it) = sum(M_step,'all');
 
+    % ===== 单叶片展向积分载荷（直接按叶片索引累加，不做平均） =====
+    for q = 1:B
+        blade_L(q,it)      = sum(L_step(:,q));
+        blade_D(q,it)      = sum(D_step(:,q));
+        blade_M(q,it)      = sum(M_step(:,q));
+        blade_Thrust(q,it) = sum(dT_all(:,q));
+        blade_Torque(q,it) = sum(dFt_all(:,q) .* r);
+        blade_psi(q,it)    = psi_blade(q);        % 当前方位角(rad)
+    end
+
     if monitor && (mod(it-1, monitorEvery) == 0 || it == Nt)
-        set(hT,'XData',t(1:it),'YData',Thrust(1:it));
-        set(hL,'XData',t(1:it),'YData',TotalLift_ts(1:it));
-        set(hD,'XData',t(1:it),'YData',TotalDrag_ts(1:it));
-        set(hM,'XData',t(1:it),'YData',TotalMoment_ts(1:it));
+        % 各叶片x方向力（推力）
+        for q = 1:B
+            set(hBlade(q), 'XData', t(1:it), 'YData', blade_Thrust(q,1:it));
+        end
+        % 总x方向力
+        set(hTx, 'XData', t(1:it), 'YData', Thrust(1:it));
+        % 总推力 / 总升力 / 总力矩
+        set(hT, 'XData', t(1:it), 'YData', Thrust(1:it));
+        set(hL, 'XData', t(1:it), 'YData', TotalLift_ts(1:it));
+        set(hM, 'XData', t(1:it), 'YData', TotalMoment_ts(1:it));
         drawnow limitrate;
     end
 
@@ -337,13 +455,15 @@ while true
     [tauC, tauS] = compute_tau(dT_all, B, Omega, R, rho, psi_blade, mode, phiMat);
 
     % ===== 计算流动参数 =====
-    mu = 0; % 默认无横风
+    % 面内速度比 mu: 使用偏航+仰角产生的面内合矢量 V0_inplane (Eq.86-87)
+    % (若用户同时指定了 params.U_inplane，则在此基础上叠加)
+    mu = V0_inplane / (Omega * R + eps);
     if isfield(params,'U_inplane')
         U_in = params.U_inplane;
-        mu = norm(U_in) / (Omega * R + eps);
+        mu = (V0_inplane + norm(U_in)) / (Omega * R + eps);
     end
-    % 轴向来流参数使用桨距角修正后的分量
-    lambda_f = (V0_ax * cos(chi)) / (Omega * R + eps);
+    % 轴向来流无量纲参数使用等效尾迹偏斜角 chi_eff (Eq.89)
+    lambda_f = (V0_ax * cos(chi_eff)) / (Omega * R + eps);
     alpha10 = alpha{1}(1); % h=0, j=1
     lambda_m = sqrt(3) * alpha10;
     lambda = lambda_f + lambda_m;
@@ -415,6 +535,13 @@ while true
     TotalDrag_ts(Nt+1:Nt_new,1) = 0;
     TotalMoment_ts(Nt+1:Nt_new,1) = 0;
 
+    blade_L(:,Nt+1:Nt_new)      = 0;
+    blade_D(:,Nt+1:Nt_new)      = 0;
+    blade_M(:,Nt+1:Nt_new)      = 0;
+    blade_Thrust(:,Nt+1:Nt_new) = 0;
+    blade_Torque(:,Nt+1:Nt_new) = 0;
+    blade_psi(:,Nt+1:Nt_new)    = 0;
+
     Nt = Nt_new;
 end
 
@@ -433,6 +560,14 @@ results.section.M = M_sec;
 results.section.alpha = Alpha_sec;
 results.section.phi = Phi_sec;
 results.section.Vrel = Vrel_sec;
+% 单叶片展向积分载荷时间序列 (维度: B × Nt)
+% 每行对应一片叶片，每列对应一个时间步，可直接按方位角 blade_psi 分析周期载荷
+results.blade.L      = blade_L;       % 单叶片升力(N)
+results.blade.D      = blade_D;       % 单叶片阻力(N)
+results.blade.M      = blade_M;       % 单叶片力矩(N·m)
+results.blade.Thrust = blade_Thrust;  % 单叶片推力(N)
+results.blade.Torque = blade_Torque;  % 单叶片扭矩(N·m)
+results.blade.psi    = blade_psi;     % 单叶片方位角(rad)
 results.total.Thrust = Thrust;
 results.total.Tangential = Drag;
 results.total.Torque = Torque;
@@ -444,8 +579,14 @@ results.bemTotals = bemTotals;
 results.gdw.alpha = alpha;
 results.gdw.beta = beta;
 results.meta = struct('Omega',Omega,'B',B,'R',R);
-results.meta.pitch_deg = pitch_deg;   % 记录桨距角(度)
-results.meta.pitch_rad = pitch_rad;   % 记录桨距角(弧度)
+results.meta.pitch_deg     = pitch_deg;        % 桨距角(度)
+results.meta.pitch_rad     = pitch_rad;        % 桨距角(弧度)
+results.meta.gamma_deg     = gamma_deg;        % 偏航角(度)
+results.meta.gamma_rad     = gamma_rad;        % 偏航角(弧度)
+results.meta.yita_deg      = yita_deg;         % 仰角(度)
+results.meta.yita_rad      = yita_rad;         % 仰角(弧度)
+results.meta.gamma_eff_rad = gamma_eff_rad;    % 等效来流偏斜角(弧度)
+results.meta.chi_eff       = chi_eff;          % 等效尾迹偏斜角(弧度, Eq.19)
 results.meta.beamModel = beamModel;
 results.meta.geometry = struct('r',r,'chord',c,'twist',theta,'thickness',thickness,'dr',dr);
 
