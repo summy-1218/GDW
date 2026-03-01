@@ -58,22 +58,43 @@ This is a MATLAB-based wind turbine aerodynamics simulator implementing Blade El
 - Enable `params.useSparse = true` for memory efficiency with large numbers of elements
 - Monitor convergence with `params.monitor = true` for real-time force plots
 
-### Pitch Angle Parameter (`params.pitch`)
+### Inflow Angle Parameters
+
+#### Pitch Angle (`params.pitch`)
 - **Parameter**: `params.pitch` — collective blade pitch angle in **degrees**, default `0`
 - **Sign convention**: Positive pitch rotates the blade leading edge towards feathering (rotation about negative z-axis / blade spanwise axis)
-- **Coordinate transform**: The freestream velocity `V0` (along rotor x-axis) is decomposed via a rotation matrix into:
-  - Axial component: `V0_ax = V0 * cos(pitch_rad)` — perpendicular to rotor plane, drives BEM induction and GDW wake
-  - In-plane component: `V0_ip = -V0 * sin(pitch_rad)` — tangential component added to the local blade tangential velocity
-- **Effect on aerodynamics**:
-  - Axial inflow angle `Phi = atan2(V0_ax - u_ind, Omega*r*(1+a') + V0_ip)`
-  - Angle of attack `Alpha = Phi - theta` (where `theta` is the geometric twist)
-  - Increasing `pitch` (positive) reduces axial component, decreases loading
-- **Usage example**:
-  ```matlab
-  params.pitch = 5;   % 5-degree pitch towards feathering
-  main_GDW;
-  ```
-- **Output**: `results.meta.pitch_deg` and `results.meta.pitch_rad` record the applied pitch angle
+- **Effect**: Applied as an additive offset to the geometric twist angle when computing angle of attack: `Alpha = Phi - deg2rad(theta + pitch_deg)`
+- **Output**: `results.meta.pitch_deg`, `results.meta.pitch_rad`
+
+#### Yaw Angle (`params.gamma`)
+- **Parameter**: `params.gamma` — rotor yaw angle in **degrees**, default `0`
+- **Sign convention**: Positive yaw means the rotor axis rotates clockwise (viewed from above) away from the wind direction, i.e. wind approaches the rotor plane from the left side
+- **Effect**: Produces a lateral in-plane velocity component `V0_lat = V0 * cos(yita) * sin(gamma)` that varies the effective tangential velocity with azimuth angle
+- **Output**: `results.meta.gamma_deg`, `results.meta.gamma_rad`
+
+#### Tilt Angle (`params.yita`)
+- **Parameter**: `params.yita` — rotor tilt (shaft uptilt) angle in **degrees**, default `0`
+- **Sign convention**: Positive tilt means the rotor axis tilts upward (nose up), so wind approaches the rotor plane from below
+- **Effect**: Produces a constant in-plane vertical velocity component `V0_elev = V0 * sin(yita)` added to the tangential velocity at every blade element
+- **Output**: `results.meta.yita_deg`, `results.meta.yita_rad`
+
+#### Freestream Velocity Decomposition
+Given `V0` along the global x-axis (aligned with undisturbed wind), the three parameters together decompose into:
+```
+V0_ax   = V0 · cos(yita) · cos(gamma)     % axial (perpendicular to rotor plane)
+V0_lat  = V0 · cos(yita) · sin(gamma)     % lateral in-plane (yaw-induced)
+V0_elev = V0 · sin(yita)                  % vertical in-plane (tilt-induced)
+```
+The resultant in-plane speed `V0_inplane = sqrt(V0_lat² + V0_elev²)` feeds the GDW advance ratio `mu`.
+
+#### Skewed Wake Correction (AeroDyn Theory Manual Eq. 17–19)
+When yaw or tilt is non-zero, an equivalent skew angle is computed and applied:
+1. `gamma_eff = atan2(V0_inplane, V0_ax)` — effective inflow skew angle
+2. `chi_eff = (0.6 · a_avg + 1) · gamma_eff` — wake skew angle (Eq. 19, Burton et al. 2001)
+3. Per-element azimuthal induction correction (Eq. 17, Pitt & Peters 1981):
+   `a_skew = a_BEM · [1 + (15π/32) · tan(chi_eff/2) · (r/R) · cos(ψ)]`
+4. GDW matrices (`precompute_gdw_matrices`) and `lambda_f` (Eq. 89) both use `chi_eff`
+- **Output**: `results.meta.gamma_eff_rad`, `results.meta.chi_eff`
 
 ### Initial Conditions
 GDW requires BEM initialization for stability. The `bem_initialize` function provides induction factors that serve as physically meaningful starting conditions for the wake state evolution.
@@ -87,6 +108,32 @@ The ABM4 implementation includes startup phase with explicit Euler steps for the
 - Vectorized airfoil interpolation and force calculations where possible
 
 ### Output Interpretation
-- `results.total.Lift/Drag/Moment`: Time series of overall rotor forces
+- `results.total.Lift/Drag/Moment`: Time series of overall rotor forces (all blades summed)
+- `results.total.Thrust/Torque`: Time series of rotor thrust and shaft torque
 - `results.bemTotals`: Steady BEM reference values for comparison
-- `results.section.*`: Detailed sectional data for each blade element over time
+- `results.section.*`: Detailed sectional data `[Nstations × B × Nt]` for each blade element over time
+- `results.blade.*`: Per-blade span-integrated loads `[B × Nt]` — each row is one blade, NOT averaged across blades
+  - `results.blade.L/D/M`: Lift, drag, and moment per blade per time step (N, N, N·m)
+  - `results.blade.Thrust/Torque`: Axial thrust and shaft torque per blade (N, N·m)
+  - `results.blade.psi`: Azimuth angle of each blade at each time step (rad)
+- `results.meta`: Simulation metadata including all inflow angle parameters
+
+### Visualization (`plot_aero_comparison`)
+Generates two figures:
+
+**Figure 1 — Total rotor loads vs. time** (unchanged):
+- Subplot 1/2/3: total lift / drag / moment time series vs. BEM steady baseline
+
+**Figure 2 — Per-blade dynamic loads** (2×3 layout):
+| | Lift | Drag | Torque |
+|---|---|---|---|
+| **vs. Azimuth angle** | each blade's lift vs. ψ (°) | each blade's drag vs. ψ (°) | each blade's torque vs. ψ (°) |
+| **vs. Time** | each blade's lift vs. t (s) | each blade's drag vs. t (s) | each blade's torque vs. t (s) |
+
+Azimuth subplots use data from the last full rotation period; blades are shown with separate colored lines (no averaging). Under yaw/tilt conditions, the three blade curves will be offset in phase, clearly revealing azimuth-dependent asymmetric loading.
+
+### Dynamic Monitor (`params.monitor = true`)
+Real-time 2×3 monitoring window during time integration:
+- **Top-left (2 columns)**: Each blade's x-direction force (thrust) — one colored line per blade
+- **Top-right**: Total x-direction force (thrust)
+- **Bottom row**: Total thrust | Total lift | Total moment
