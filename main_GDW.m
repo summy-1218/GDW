@@ -18,6 +18,7 @@ params.plot = true;
 params.monitor = true;
 params.useParallel = true;
 params.useSparse = true;
+params.pitch = 0;          % 桨距角(度), 正方向为绕z轴负向旋转
 % 基于BEM初始化 + GDW三维非定常气动力计算
 % 坐标系: x轴-旋转轴正向, z轴-叶片展向, y轴-叶片弦向
 
@@ -37,6 +38,21 @@ rho = getField(params,'rho',1.225);
 V0 = getField(params,'V0',9);          % 来流速度(沿x轴)
 RootOffset = getField(params,'RootOffset',0.05); % 叶根偏移
 R_hub = getField(params,'R_hub',1.56); % 叶轮半径(用于Prandtl损失计算)
+
+% ===== 桨距角参数 =====
+% pitch 正方向定义: 绕z轴负向旋转(即前缘向顺桨方向)
+pitch_deg = getField(params,'pitch',0);   % 桨距角(度), 默认0度
+pitch_rad = deg2rad(pitch_deg);           % 转换为弧度
+% 坐标变换: 来流速度V0(沿x轴)经桨距角旋转后在叶片剖面的投影
+%   轴向分量 V0_ax = V0 * cos(pitch_rad)  (垂直于旋转平面)
+%   面内分量 V0_ip = V0 * sin(pitch_rad)  (平行于旋转平面, 增加/减少切向速度)
+% 旋转矩阵 (绕z轴负向旋转pitch角):
+%   [V_ax ]   [ cos(pitch)  sin(pitch)] [V0]
+%   [V_ip ] = [-sin(pitch)  cos(pitch)] [ 0]
+% => V_ax = V0*cos(pitch_rad), V_ip = -V0*sin(pitch_rad)
+% 注: V_ip 为正时沿叶片切线方向(增加有效切速), 符合右手螺旋正方向定义
+V0_ax = V0 * cos(pitch_rad);   % 轴向有效来流分量
+V0_ip = -V0 * sin(pitch_rad);  % 面内(切向)有效来流分量(正值增大切向速度)
 
 % ===== 叶片结构模型与翼型数据 =====
 [beamModel, r, c, theta, thickness, dr] = resolve_blade_geometry(params);
@@ -84,14 +100,15 @@ else
 end
 
 % ===== 1) BEM初始化（稳态） =====
-[bem] = bem_initialize(r, c, theta, thickness, B, R, R_hub, RootOffset, V0, Omega, maxIter, tolerance, relax);
+% BEM初始化使用轴向有效来流分量V0_ax
+[bem] = bem_initialize(r, c, theta, thickness, B, R, R_hub, RootOffset, V0_ax, Omega, maxIter, tolerance, relax);
 
 % ===== 2) GDW状态初始化 =====
 mode = build_modes(N_h, S_h);
 phiMat = precompute_shape_functions(mode, rhat);
 
 % 初始化诱导速度系数: 仅用h=0拟合轴向诱导速度
-u_ind0 = bem.a .* V0; % 轴向诱导速度(正向与V0相反)
+u_ind0 = bem.a .* V0_ax; % 轴向诱导速度(正向与V0_ax相反)
 uhat0 = u_ind0 / (Omega * R + eps);
 alpha = cell(N_h+1,1);
 beta = cell(N_h+1,1);
@@ -200,9 +217,10 @@ while true
             dFq = zeros(Nstations,1);
             for ii = 1:numel(activeIdx)
                 i = activeIdx(ii);
-                Uax = V0 - u_ind(i,q);
-
-                Ut = Omega_r(i)*(1+bem.ap(i)); % 使用BEM的a'
+                % 轴向速度: 使用桨距角修正后的轴向来流分量
+                Uax = V0_ax - u_ind(i,q);
+                % 切向速度: BEM的切向诱导速度 + 桨距角引起的面内来流分量
+                Ut = Omega_r(i)*(1+bem.ap(i)) + V0_ip; % 使用BEM的a'
                 % Phi_i = atan2(Uax, Ut);
                 % Alpha_i = Phi_i - deg2rad(theta(i));
                 % [Cl_i, Cd_i, ~] = aeroInterp(thickness(i), Alpha_i);
@@ -246,9 +264,10 @@ while true
         for q = 1:B
             for ii = 1:numel(activeIdx)
                 i = activeIdx(ii);
-                Uax = V0 - u_ind(i,q);
-
-                Ut = Omega_r(i)*(1+bem.ap(i)); % 先忽略a'
+                % 轴向速度: 使用桨距角修正后的轴向来流分量
+                Uax = V0_ax - u_ind(i,q);
+                % 切向速度: BEM的切向诱导速度 + 桨距角引起的面内来流分量
+                Ut = Omega_r(i)*(1+bem.ap(i)) + V0_ip; % 先忽略a'
                 % Phi_i = atan2(Uax, Ut);
                 % Alpha_i = Phi_i - deg2rad(theta(i));
                 % [Cl_i, Cd_i, ~] = aeroInterp(thickness(i), Alpha_i);
@@ -323,7 +342,8 @@ while true
         U_in = params.U_inplane;
         mu = norm(U_in) / (Omega * R + eps);
     end
-    lambda_f = (V0 * cos(chi)) / (Omega * R + eps);
+    % 轴向来流参数使用桨距角修正后的分量
+    lambda_f = (V0_ax * cos(chi)) / (Omega * R + eps);
     alpha10 = alpha{1}(1); % h=0, j=1
     lambda_m = sqrt(3) * alpha10;
     lambda = lambda_f + lambda_m;
@@ -424,6 +444,8 @@ results.bemTotals = bemTotals;
 results.gdw.alpha = alpha;
 results.gdw.beta = beta;
 results.meta = struct('Omega',Omega,'B',B,'R',R);
+results.meta.pitch_deg = pitch_deg;   % 记录桨距角(度)
+results.meta.pitch_rad = pitch_rad;   % 记录桨距角(弧度)
 results.meta.beamModel = beamModel;
 results.meta.geometry = struct('r',r,'chord',c,'twist',theta,'thickness',thickness,'dr',dr);
 
