@@ -96,11 +96,77 @@ When yaw or tilt is non-zero, an equivalent skew angle is computed and applied:
 4. GDW matrices (`precompute_gdw_matrices`) and `lambda_f` (Eq. 89) both use `chi_eff`
 - **Output**: `results.meta.gamma_eff_rad`, `results.meta.chi_eff`
 
+#### Hub Offset Length (`params.hub_offset`)
+- **Parameter**: `params.hub_offset` — extra distance `L` (metres) from rotation centre to blade root, default `0`
+- **Sign convention**: Non-negative value; increases the effective rotor diameter to `2·(R + L)`
+- **Effect**: Each blade element's actual rotation radius becomes `r_rot = r + L`, so the base tangential velocity is `Omega · (r + L)`. The additional `Omega·L` term uniformly increases the tangential velocity at every element, raising lift and torque along the full span
+- **Scope**: Applied to both BEM initialization and GDW time-marching tangential velocity; GDW inflow states and `rhat = r/R` remain unchanged
+- **Output**: `results.meta.hub_L`
+
+#### Cone Angle (`params.cone`)
+- **Parameter**: `params.cone` — blade coning angle in **degrees**, default `0`
+- **Sign convention**: Positive cone angle means blades deflect downwind (towards the lee side), forming a downwind cone
+- **Effect**: Decomposes the axial freestream `V0_ax` (after yaw/tilt correction) into two components in the blade's local frame:
+  - Normal to the local rotation plane: `V0_ax_cone = V0_ax · cos(cone)` — effective axial inflow driving induction
+  - Along the blade spanwise direction (tangential): `V0_ax_tan = −V0_ax · sin(cone)` — positive cone reduces effective tangential speed
+- **GDW constraint**: The GDW inflow states and wake matrices assume a flat rotor disc and are **not** modified by cone angle; only the velocity components at each blade element are corrected
+- **Output**: `results.meta.cone_deg`, `results.meta.cone_rad`
+
+#### Combined Velocity Assembly (per blade element)
+```
+Uax = V0_ax·cos(cone) − u_ind_GDW − a_skew·V0_ax·cos(cone)
+Ut  = Omega·(r+L)·(1+a') + V0_lat·cos(ψ) + V0_elev − V0_ax·sin(cone)
+```
+
 ### Initial Conditions
 GDW requires BEM initialization for stability. The `bem_initialize` function provides induction factors that serve as physically meaningful starting conditions for the wake state evolution.
 
 ### Time Integration
 The ABM4 implementation includes startup phase with explicit Euler steps for the first 3 iterations before switching to predictor-corrector mode, ensuring numerical stability.
+
+### GDW Inflow Gain Matrix — Cross-Harmonic Coupling (Ltilde)
+
+> **[BUG FIX — Core Algorithm]** Previous versions of `precompute_gdw_matrices.m` incorrectly assumed that the row harmonic index `r` (induced-velocity harmonics) and the column harmonic index `m` (pressure harmonics) must be equal, resulting in a block-diagonal `Ltilde` that was always symmetric. This violates Eq. 74–76 of the AeroDyn Theory Manual, where `r` and `m` are independent.
+
+#### Correct Implementation (current)
+
+`precompute_gdw_matrices` now builds two **global** matrices:
+
+| Matrix | Size | Governing equation |
+|--------|------|--------------------|
+| `LtildeC` | `N_c × N_c` | Eq. 74 (`r=0`) and Eq. 75 (`r>0`, cosine) |
+| `LtildeS` | `N_s × N_s` | Eq. 76 (`r>0`, sine) |
+
+where `N_c = Σ S_h` (h=0…N), `N_s = Σ S_h` (h=1…N).
+
+Row index `(r, j)` and column index `(m, n)` are **fully independent**, so every pair `(r, m)` can contribute a non-zero entry:
+
+```
+Eq.74  r=0:  Ltilde_{jn}^{0m,c}  = X^m · Γ_{jn}^{0m}          (all m)
+Eq.75  r>0:  Ltilde_{jn}^{rm,c}  = (X^|m-r| + (−1)^l · X^|m+r|) · Γ_{jn}^{rm}
+Eq.76  r>0:  Ltilde_{jn}^{rm,s}  = (X^|m-r| − (−1)^l · X^|m+r|) · Γ_{jn}^{rm}
+             l = min(r, m),  X^0 ≡ 1  (manual note after Eq.78)
+```
+
+#### Impact of the fix
+
+- `LtildeC` and `LtildeS` are in general **non-symmetric** (as physically expected)
+- All cross-harmonic coupling paths are now included; previously they were entirely absent
+- The GDW state equation is now solved as a **single global system** rather than `N+1` independent per-harmonic sub-problems
+- `main_GDW.m` now uses global state vectors `alphaVec` / `betaVec` and the helper arrays `offC` / `offS` to index into them
+
+#### API change
+
+`precompute_gdw_matrices` signature changed from:
+```matlab
+[Mdiag, LtildeC, LtildeS] = precompute_gdw_matrices(mode, chi)
+% returned cell arrays: Mdiag{h+1}, LtildeC{h+1}, LtildeS{h+1}
+```
+to:
+```matlab
+[Mdiag_c, Mdiag_s, LtildeC, LtildeS, offC, offS] = precompute_gdw_matrices(mode, chi)
+% returns full matrices + offset arrays
+```
 
 ### Performance Optimization
 - Precomputes GDW matrices (`precompute_gdw_matrices.m`) to avoid repeated calculations
