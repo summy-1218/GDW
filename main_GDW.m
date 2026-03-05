@@ -22,7 +22,7 @@ params.useSparse = true;
 params.pitch = 0;          % 桨距角(度), 正方向为绕z轴负向旋转
 params.gamma = 0;          % 偏航角(度): 风轮旋转轴在水平面内偏离来流方向的角度
                            %   正方向: 从上方俯视，风轮轴顺时针偏离来流(即来流从左侧进入旋转平面)
-params.yita  = 0;          % 仰角(度): 风轮旋转轴与水平面之间的夹角(即主轴上仰/下俯角度)
+params.yita  = 6;          % 仰角(度): 风轮旋转轴与水平面之间的夹角(即主轴上仰/下俯角度)
                            %   正方向: 旋转轴朝上倾斜(机头仰起), 来流从下方斜入旋转平面
 params.hub_offset = 0;     % 轮毂偏置长度L(m): 旋转中心到叶片根部的额外距离
                            %   整机旋转平面直径变为 2*(R+L)
@@ -296,13 +296,9 @@ while true
     while it <= Nt
     psi_blade = Omega * t(it) + (0:B-1) * (2*pi/B);
 
-    % ===== 偏斜入流修正系数 (Eq.17: a_skew = a*[1 + K*(r/R)*tan(chi/2)*cos(psi)]) =====
-    % psi 定义: 0 为最下风侧位置(Eq.17 注释); 此处 psi_blade 从任意方位角零点计，
-    % 对于风力机，通常令最下风侧(6点钟方向)为 psi=0，但本代码 psi 是从初始位置算起的方位角，
-    % 物理上偏斜修正的方位角依赖性通过 cos(psi_blade) 体现，方向一致性已满足。
-    skew_K = (15*pi/32) * tan(chi_eff/2);  % Eq.17 中的偏斜常数 K
-    % skew_factor(i,q) = 1 + K*(r(i)/R)*cos(psi_blade(q))
-    % 用于在叶素循环中修正局部轴向诱导因子: a_local = a_BEM * skew_factor
+    % 偏斜入流修正（BEM skewed wake correction, Eq.17）在 GDW 模式下不启用：
+    % GDW 状态方程已通过 chi_eff 和 LtildeC/LtildeS 矩阵隐含了偏斜尾流效应，
+    % 无需再对叶素轴向诱导因子做 cos(psi) 方位角修正，避免双重计入。
 
     % 计算诱导速度场(轴向)：从全局向量 alphaVec/betaVec 解包各谐波分量
     uhat = zeros(Nstations, B);
@@ -347,19 +343,15 @@ while true
             psi_q = psi_blade(q);  % 第q片叶片当前方位角
             for ii = 1:numel(activeIdx)
                 i = activeIdx(ii);
-                % % --- 偏斜修正局部轴向诱导因子 (Eq.17/29) ---
-                % % a_skew = a_BEM * [1 + K*(r/R)*cos(psi)]
-                % skew_fac = 1 + skew_K * rhat(i) * cos(psi_q);
-                % a_local = bem.a(i) * skew_fac;
-                % % 轴向速度: 锥角修正后的轴向来流 - GDW诱导速度 - BEM偏斜诱导
-                % Uax = V0_ax_cone - u_ind(i,q) - a_local * V0_ax_cone;
-
                 % 轴向速度: 锥角修正后的轴向来流 - GDW诱导速度
+                % GDW 状态方程本身通过迭代隐含了轴向诱导效应，
+                % 无需再叠加 BEM 轴向诱导因子 a_BEM，否则会造成双重计入。
                 Uax = V0_ax_cone - u_ind(i,q);
 
                 % 切向速度: Omega*(r+L)*(1+a') + 偏航/仰角面内分量 + 锥角切向附加量
                 % V0_ax_tan = -V0_ax*sin(cone): 顺锥角时来流分量沿叶展向，减小有效切速
-                Ut = Omega_r(i)*(1+bem.ap(i)) + V0_lat*cos(psi_q) + V0_elev + V0_ax_tan; % 使用BEM的a'
+                % 切向诱导仍沿用 BEM 的 a'（GDW 不求解切向诱导）
+                Ut = Omega_r(i)*(1+bem.ap(i)) + V0_lat*cos(psi_q) + V0_elev + V0_ax_tan;
 
                 Vrel = hypot(Uax, Ut);
                 Phi_i = atan2(Uax, Ut);
@@ -398,17 +390,14 @@ while true
             psi_q = psi_blade(q);  % 第q片叶片当前方位角
             for ii = 1:numel(activeIdx)
                 i = activeIdx(ii);
-                % % --- 偏斜修正局部轴向诱导因子 (Eq.17/29) ---
-                % skew_fac = 1 + skew_K * rhat(i) * cos(psi_q);
-                % a_local = bem.a(i) * skew_fac;
-                % % 轴向速度: 锥角修正后的轴向来流 - GDW诱导速度 - BEM偏斜诱导
-                % Uax = V0_ax_cone - u_ind(i,q) - a_local * V0_ax_cone;
                 % 轴向速度: 锥角修正后的轴向来流 - GDW诱导速度
+                % GDW 状态方程本身通过迭代隐含了轴向诱导效应，
+                % 无需再叠加 BEM 轴向诱导因子 a_BEM，否则会造成双重计入。
                 Uax = V0_ax_cone - u_ind(i,q);
 
                 % 切向速度: Omega*(r+L)*(1+a') + 偏航/仰角面内分量 + 锥角切向附加量
-                Ut = Omega_r(i)*(1+bem.ap(i)) + V0_lat*cos(psi_q) + V0_elev + V0_ax_tan; % 先忽略a'            
-                
+                % 切向诱导仍沿用 BEM 的 a'（GDW 不求解切向诱导）
+                Ut = Omega_r(i)*(1+bem.ap(i)) + V0_lat*cos(psi_q) + V0_elev + V0_ax_tan;
                 Vrel = hypot(Uax, Ut);
                 Phi_i = atan2(Uax, Ut);
                 % 有效扭角 = 几何扭角 + 桨距角 (正pitch减小攻角，即顺桨)

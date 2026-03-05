@@ -114,9 +114,15 @@ When yaw or tilt is non-zero, an equivalent skew angle is computed and applied:
 
 #### Combined Velocity Assembly (per blade element)
 ```
-Uax = V0_ax·cos(cone) − u_ind_GDW − a_skew·V0_ax·cos(cone)
-Ut  = Omega·(r+L)·(1+a') + V0_lat·cos(ψ) + V0_elev − V0_ax·sin(cone)
+Uax = V0_ax·cos(cone) − u_ind_GDW
+Ut  = Omega·(r+L)·(1+a'_BEM) + V0_lat·cos(ψ) + V0_elev − V0_ax·sin(cone)
 ```
+> **Note**: The axial induction is supplied entirely by the GDW induced velocity `u_ind_GDW`.
+> The BEM axial induction factor `a_BEM` is **not** subtracted separately — doing so would
+> double-count the axial induction, since the GDW state equations already account for it
+> implicitly through the iterative wake evolution.
+> The tangential induction `a'_BEM` from BEM is still used for `Ut` because GDW does not
+> solve for tangential induction.
 
 ### Initial Conditions
 GDW requires BEM initialization for stability. The `bem_initialize` function provides induction factors that serve as physically meaningful starting conditions for the wake state evolution.
